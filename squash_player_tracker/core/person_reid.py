@@ -3,7 +3,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchreid
-from torchreid.utils import FeatureExtractor
+from torchreid.utils.feature_extractor import FeatureExtractor
+
 
 class PersonReID:
     def __init__(self, model_name='osnet_x1_0', model_path=None, use_gpu=True):
@@ -85,6 +86,9 @@ class PersonReID:
         
         # Compute average feature vector for quick matching
         self.person_features[person_id] = np.mean(self.features_history[person_id], axis=0)
+        
+        # Debug output for tracking re-ID
+        print(f"Added/updated features for {person_id}, total people: {len(self.person_features)}")
         return True
     
     def identify_person(self, image, bbox):
@@ -128,8 +132,10 @@ class PersonReID:
                     best_match = person_id
         
         if highest_similarity > self.similarity_threshold:
+            print(f"Re-ID match: {best_match} with similarity {highest_similarity:.2f}")
             return best_match, highest_similarity
         else:
+            print(f"No re-ID match found, best similarity: {highest_similarity:.2f}")
             return None, highest_similarity
     
     def update_features(self, person_id, image, bbox):

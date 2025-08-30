@@ -23,10 +23,6 @@ def main():
                         help='Path to save output video (optional)')
     parser.add_argument('--no-display', action='store_true',
                         help='Disable display of processed frames')
-    parser.add_argument('--id-frames', type=int, default=50,
-                        help='Number of frames for identification phase')
-    parser.add_argument('--face-conf', type=float, default=0.5,
-                        help='Face recognition confidence threshold')
     parser.add_argument('--det-conf', type=float, default=0.5,
                         help='Person detection confidence threshold')
     parser.add_argument('--reid-thresh', type=float, default=0.35,
@@ -52,14 +48,12 @@ def main():
     try:
         # Initialize tracker
         tracker = SquashPlayerTracker(
-            face_recognition_conf=args.face_conf,
             detection_conf=args.det_conf,
             reid_threshold=args.reid_thresh,
             use_gpu=not args.cpu
         )
         
-        # Set identification phase frames
-        tracker.set_identification_phase(args.id_frames)
+        # Identity phase frames parameter is now handled internally
         
         # Process video
         print(f"Processing video: {args.video}")

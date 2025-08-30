@@ -10,10 +10,10 @@ setup(
         "torch>=2.0.0",
         "torchvision>=0.15.0",
         "ultralytics>=8.0.0",  # For YOLOv8
-        "insightface>=0.7.0",  # For ArcFace face recognition
-        "torchreid==0.2.5",    # For OSNet person re-identification    # For OSNet person re-identification
+        "torchreid==0.2.5",    # For OSNet person re-identification
         "scikit-learn>=1.3.0",
         "matplotlib>=3.7.0",
+        "deep-sort-realtime>=1.3.2",
     ],
     python_requires=">=3.8",
 )
