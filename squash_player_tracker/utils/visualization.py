@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-def draw_bbox(image, bbox, label=None, color=(0, 255, 0), thickness=2):
+def draw_bbox(image, bbox, label=None, color=(0, 255, 255), thickness=2):  # Yellow in BGR
     """
     Draw a bounding box on an image
     

@@ -32,8 +32,14 @@ class Track:
         x1, y1, x2, y2 = bbox
         return ((x1 + x2) // 2, (y1 + y2) // 2)
     
-    def update(self, bbox):
-        """Update track with new detection"""
+    def update(self, bbox, is_smoothed=False):
+        """
+        Update track with new detection
+        
+        Args:
+            bbox: New bounding box coordinates (x1, y1, x2, y2)
+            is_smoothed: Whether this bbox is already smoothed (e.g., from median filter)
+        """
         # Validate bbox format
         if not isinstance(bbox, tuple) or len(bbox) != 4:
             print(f"Invalid bbox format: {bbox}")
@@ -53,7 +59,7 @@ class Track:
             validated_bbox = (x1, y1, x2, y2)
             
             # Update velocity information before updating position
-            if len(self.history) > 0:
+            if len(self.history) > 0 and not is_smoothed:
                 prev_bbox = self.history[-1]
                 x1_prev, y1_prev, x2_prev, y2_prev = prev_bbox
                 w_prev = x2_prev - x1_prev
@@ -88,7 +94,11 @@ class Track:
             self.bbox = validated_bbox
             self.center = self._get_center(validated_bbox)
             self.history.append(validated_bbox)
-            self.hits += 1
+            
+            # Only increment hits if not smoothed to avoid duplicate counting
+            if not is_smoothed:
+                self.hits += 1
+                
             self.age = 0
             self.time_since_update = 0
         except Exception as e:
@@ -425,11 +435,8 @@ class ByteTracker:
             if track.hits >= self.min_hits and not track.is_deleted():
                 x1, y1, x2, y2 = track.bbox
                 
-                # Draw bounding box (use different color when coasting/predicted)
-                if track.time_since_update > 0:
-                    color = (0, 255, 255)  # predicted (coasting) - cyan
-                else:
-                    color = (0, 255, 0) if track.player_name else (0, 165, 255)
+                # Draw bounding box in yellow (highlight color)
+                color = (0, 255, 255)  # yellow in BGR
                 cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
                 
                 # Draw track ID and player name
@@ -452,6 +459,6 @@ class ByteTracker:
                         curr_center = ((curr_bbox[0] + curr_bbox[2]) // 2, 
                                       (curr_bbox[1] + curr_bbox[3]) // 2)
                         
-                        cv2.line(img, prev_center, curr_center, color, 2)
+                        cv2.line(img, prev_center, curr_center, (0, 255, 255), 2)  # yellow in BGR
         
         return img

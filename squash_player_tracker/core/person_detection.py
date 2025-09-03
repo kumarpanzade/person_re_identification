@@ -90,8 +90,8 @@ class PersonDetector:
         """
         img = image.copy()
         for (x1, y1, x2, y2), confidence in detections:
-            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow in BGR
             label = f"Person: {confidence:.2f}"
-            cv2.putText(img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            cv2.putText(img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)  # Yellow in BGR
             
         return img

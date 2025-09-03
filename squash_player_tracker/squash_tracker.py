@@ -3,7 +3,9 @@ import cv2
 import numpy as np
 import argparse
 import time
+import ctypes
 from collections import defaultdict
+from typing import List, Dict, Tuple, Optional
 
 # Import core modules
 from squash_player_tracker.core.person_detection import PersonDetector
@@ -15,8 +17,28 @@ try:
 except Exception:
     from torchreid.utils.feature_extractor import FeatureExtractor
 
+def get_screen_resolution():
+    """
+    Detect the primary screen resolution.
+    
+    Returns:
+        tuple: (width, height) of the primary screen
+    """
+    try:
+        # Try to get screen resolution using ctypes for Windows
+        if os.name == 'nt':  # Windows
+            user32 = ctypes.windll.user32
+            return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        # For Linux/WSL, try using an environment variable or default to common laptop resolution
+        else:
+            # Default to a common laptop screen resolution if detection fails
+            return 1920, 1080
+    except Exception:
+        # Default fallback resolution
+        return 1280, 720
+
 class SquashPlayerTracker:
-    def __init__(self, detection_conf=0.7, reid_threshold=0.6, use_gpu=True):
+    def __init__(self, detection_conf=0.6, reid_threshold=0.6, use_gpu=True, reference_embeddings=None):
         """
         Initialize the squash player tracking system.
         
@@ -24,6 +46,7 @@ class SquashPlayerTracker:
             detection_conf: Confidence threshold for person detection
             reid_threshold: Similarity threshold for person re-identification
             use_gpu: Whether to use GPU for inference
+            reference_embeddings: Optional dictionary of pre-defined person embeddings
         """
         print("Initializing Squash Player Tracker...")
         
@@ -36,30 +59,182 @@ class SquashPlayerTracker:
         self.person_reid.similarity_threshold = reid_threshold
         
         print("Initializing tracker...")
-        self.tracker = DeepSORTTracker(max_age=60, min_hits=2, iou_threshold=0.15)
-        # Modify the max_tracks attribute to limit tracking to 3 players
-        self.tracker.max_tracks = 3
+        self.tracker = DeepSORTTracker(max_age=15, min_hits=4, iou_threshold=0.8)
+        # No limit on number of players that can be tracked
+        self.tracker.max_tracks = None
         
         # State variables
         self.player_ids = {}  # Mapping from track ID to player name/ID
         self.current_frame = 0
         self.player_features = {}  # Storing player features for re-identification
         
-        # Add temporal consistency tracking for glass reflections
+        # Add temporal consistency tracking with median filtering for smooth tracking
         self.last_valid_tracks = []
-        self.consistency_window = 3  # Consider last 3 frames for temporal consistency
-        self.valid_track_history = []  # Track positions over time
+        self.consistency_window = 5  # Number of frames to use for median filtering
+        self.valid_track_history = []  # Track positions over time used for median filtering
         
         # Track player ID consistency
         self.player_track_history = {}  # Map player ID to their track history
-        self.reid_memory_frames = 30  # Remember player associations for 30 frames
+        self.reid_memory_frames = 60  # Remember player associations for 30 frames
         self.player_positions = {}  # Last known positions of players
         
         # Direct mapping of track IDs to player IDs for stronger consistency
         self.track_to_player_map = {}  # Maps track ID -> player ID
         self.player_to_track_map = {}  # Maps player ID -> track ID
+        self.locked_identities = set()  # Set of player IDs with locked identities
+        
+        # Flag to indicate if using reference embeddings
+        self.using_reference_embeddings = False
+        self.strict_id_enforcement = True  # Whether to enforce strict ID assignment
+        
+        # Track which players have had their features initialized
+        self.initialized_features = set()
+        
+        # Initialize with reference embeddings if provided
+        if reference_embeddings:
+            self.set_reference_embeddings(reference_embeddings)
         
         print("Initialization complete!")
+        
+    def ensure_features_initialized_once(self, player_id, frame=None, bbox=None):
+        """
+        Ensure a player's features are initialized only once
+        
+        Args:
+            player_id: ID of the player
+            frame: Current frame (optional)
+            bbox: Bounding box for the player (optional)
+            
+        Returns:
+            bool: True if initialized, False if already initialized
+        """
+        # If player already has features initialized, do nothing
+        if player_id in self.initialized_features:
+            return False
+            
+        # If we have reference embeddings, use those (they are already stored in the person_reid)
+        if player_id in self.person_reid.reference_embeddings:
+            self.initialized_features.add(player_id)
+            return True
+            
+        # If we have frame and bbox, extract and store features
+        if frame is not None and bbox is not None:
+            success = self.person_reid.add_person(frame, bbox, player_id)
+            if success:
+                self.initialized_features.add(player_id)
+                return True
+                
+        return False
+        
+    def set_reference_embeddings(self, embeddings):
+        """
+        Set reference embeddings for player identification
+        
+        Args:
+            embeddings: Dictionary mapping player_id to feature vector
+            
+        Returns:
+            bool: True if successful
+        """
+        if not embeddings:
+            return False
+            
+        # Set each embedding directly in the re-ID model
+        for player_id, features in embeddings.items():
+            self.person_reid.set_reference_embedding(player_id, features)
+            # Lock these identities
+            self.locked_identities.add(player_id)
+            # Mark features as initialized
+            self.initialized_features.add(player_id)
+            
+        # Set the flag to use reference embeddings only
+        self.person_reid.use_reference_only = True
+        self.using_reference_embeddings = True
+        self.person_reid.strict_id_enforcement = self.strict_id_enforcement
+        
+        print(f"Set {len(embeddings)} reference embeddings")
+        print(f"Strict ID enforcement: {self.strict_id_enforcement}")
+        return True
+        
+    def enforce_id_consistency(self, track, player_id):
+        """
+        Enforce consistent identity for a track
+        
+        Args:
+            track: Track object
+            player_id: Proposed player ID
+            
+        Returns:
+            str: Most consistent player ID for this track
+        """
+        # If this is a locked identity, prioritize it highly
+        if player_id in self.locked_identities:
+            # Update our tracking maps
+            if track.id in self.track_to_player_map and self.track_to_player_map[track.id] != player_id:
+                # This track previously had a different ID - this is a switch!
+                old_id = self.track_to_player_map[track.id]
+                print(f"WARNING: Track {track.id} changing from {old_id} to locked ID {player_id}")
+                
+                # Remove old mapping if it exists
+                if old_id in self.player_to_track_map and self.player_to_track_map[old_id] == track.id:
+                    self.player_to_track_map.pop(old_id)
+            
+            # Set the new mapping
+            self.track_to_player_map[track.id] = player_id
+            self.player_to_track_map[player_id] = track.id
+            return player_id
+            
+        # If not using reference embeddings, or not enforcing consistency, return as is
+        if not self.using_reference_embeddings or not self.strict_id_enforcement:
+            return player_id
+            
+        # Check if this track has a consistent ID from history
+        consistent_id = self.person_reid.get_consistent_id(track.id)
+        if consistent_id is not None:
+            if consistent_id != player_id:
+                print(f"ID consistency enforced: {player_id} -> {consistent_id} for track {track.id}")
+            return consistent_id
+            
+        # Use the provided ID but record it for consistency
+        enforced_id = self.person_reid.enforce_id_consistency(track.id, player_id)
+        
+        # Update our tracking maps with the enforced ID
+        self.track_to_player_map[track.id] = enforced_id
+        self.player_to_track_map[enforced_id] = track.id
+        
+        return enforced_id
+        
+    def initialize_from_reference_frames(self, reference_frames, use_reference_only=True):
+        """
+        Initialize person embeddings from reference frames
+        
+        Args:
+            reference_frames: Dictionary mapping player_id to (image, bbox)
+            use_reference_only: Whether to use only reference embeddings
+            
+        Returns:
+            bool: True if successful
+        """
+        if not reference_frames:
+            return False
+            
+        # Initialize the re-ID model with reference images
+        success = self.person_reid.initialize_from_reference_images(
+            reference_frames, 
+            use_reference_only=use_reference_only
+        )
+        
+        if success:
+            self.using_reference_embeddings = True
+            
+            # Set up player-to-track mapping for reference players
+            for player_id in reference_frames.keys():
+                self.player_to_track_map[player_id] = None  # Will be filled in when track is created
+                self.initialized_features.add(player_id)  # Mark these player IDs as having initialized features
+            
+            print(f"Initialized {len(reference_frames)} player embeddings")
+        
+        return success
     
     def process_frame(self, frame):
         """
@@ -133,66 +308,146 @@ class SquashPlayerTracker:
         # For tracking, we should have at most 3 players
         assigned_ids = [t.player_name for t in active_tracks if t.player_name]
         
-        # HARD RESET: Force assignment of unique IDs P1, P2, P3 to the top 3 tracks
-        # This ensures we never have duplicate IDs
-        
-        # First collect all tracks (both named and unnamed)
-        all_tracks = []
-        for track in active_tracks:
-            track_center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
-            track_area = (track.bbox[2] - track.bbox[0]) * (track.bbox[3] - track.bbox[1])
-            all_tracks.append({
-                'track': track,
-                'center': track_center,
-                'area': track_area,
-                'hits': track.hits
-            })
-        
-        # If we have more than 3 tracks, sort by reliability (more hits = more reliable)
-        # and keep only the top 3
-        if len(all_tracks) > 3:
-            all_tracks.sort(key=lambda x: x['hits'], reverse=True)
-            all_tracks = all_tracks[:3]
-        
-        # Sort tracks by horizontal position (left to right)
-        # This ensures consistent assignment: leftmost = P1, middle = P2, rightmost = P3
-        all_tracks.sort(key=lambda x: x['center'][0])
-        
-        # Assign P1, P2, P3 based on position
-        player_ids = ["P1", "P2", "P3"]
-        
-        print(f"RESETTING ALL PLAYER IDS - tracks: {len(all_tracks)}")
-        for i, track_data in enumerate(all_tracks):
-            if i < len(player_ids):  # Ensure we don't exceed available IDs
+        # Handle ID assignment differently based on whether we're using reference embeddings
+        if self.using_reference_embeddings:
+            # When using reference embeddings, we only assign IDs based on appearance similarity
+            # We don't force-assign IDs based on position
+            
+            # First, collect all tracks (both named and unnamed)
+            all_tracks = []
+            for track in active_tracks:
+                track_center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
+                track_area = (track.bbox[2] - track.bbox[0]) * (track.bbox[3] - track.bbox[1])
+                all_tracks.append({
+                    'track': track,
+                    'center': track_center,
+                    'area': track_area,
+                    'hits': track.hits
+                })
+            
+            # Update track-to-player mappings for all identified tracks
+            for track_data in all_tracks:
                 track = track_data['track']
-                player_id = player_ids[i]
-                
-                # Only log if the ID is changing
-                if track.player_name != player_id:
-                    old_id = track.player_name if track.player_name else "None"
-                    print(f"FORCE ASSIGNING: {old_id} -> {player_id} for track {track.id}")
-                
-                # Force set the ID
-                track.set_player_name(player_id)
-                
-                # Update our direct track-to-player mapping
-                self.track_to_player_map[track.id] = player_id
-                self.player_to_track_map[player_id] = track.id
-                
-                # Add features to re-ID model (overwriting any existing)
-                self.person_reid.add_person(frame, track.bbox, player_id)
+                if track.player_name:
+                    self.track_to_player_map[track.id] = track.player_name
+                    self.player_to_track_map[track.player_name] = track.id
+            
+            # Only update appearance features for already-identified tracks
+            # No need to call add_person as we're using fixed reference embeddings
+            
+            print(f"Using pre-defined embeddings - identified tracks: {len([t for t in active_tracks if t.player_name])}")
+        else:
+            # HARD RESET: Force assignment of unique IDs P1, P2, P3, etc. to tracks
+            # This is the original behavior when not using reference embeddings
+            
+            # First collect all tracks (both named and unnamed)
+            all_tracks = []
+            for track in active_tracks:
+                track_center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
+                track_area = (track.bbox[2] - track.bbox[0]) * (track.bbox[3] - track.bbox[1])
+                all_tracks.append({
+                    'track': track,
+                    'center': track_center,
+                    'area': track_area,
+                    'hits': track.hits
+                })
+            
+            # Sort tracks by reliability (more hits = more reliable)
+            all_tracks.sort(key=lambda x: x['hits'], reverse=True)
+            
+            # Sort tracks by horizontal position (left to right)
+            # This ensures consistent assignment based on position
+            all_tracks.sort(key=lambda x: x['center'][0])
+            
+            # Generate player IDs dynamically based on the number of tracks
+            player_ids = [f"P{i+1}" for i in range(len(all_tracks))]
+            
+            print(f"RESETTING ALL PLAYER IDS - tracks: {len(all_tracks)}")
+            for i, track_data in enumerate(all_tracks):
+                if i < len(player_ids):  # Ensure we don't exceed available IDs
+                    track = track_data['track']
+                    player_id = player_ids[i]
+                    
+                    # Only log if the ID is changing
+                    if track.player_name != player_id:
+                        old_id = track.player_name if track.player_name else "None"
+                        print(f"FORCE ASSIGNING: {old_id} -> {player_id} for track {track.id}")
+                    
+                    # Force set the ID
+                    track.set_player_name(player_id)
+                    
+                    # Update our direct track-to-player mapping
+                    self.track_to_player_map[track.id] = player_id
+                    self.player_to_track_map[player_id] = track.id
+                    
+                    # Store features only once at initialization if they don't exist already
+                    self.ensure_features_initialized_once(player_id, frame, track.bbox)
+                    # We'll use the initial features for future identification
         
-        # Update re-ID features for identified tracks
+        # Apply our enhanced ID consistency enforcement to all tracks
+        final_tracks = []
+        player_id_used = set()  # Track which player IDs have been used
+        
+        # First pass: handle tracks with consistent IDs
         for track in active_tracks:
             if track.player_name:
-                self.person_reid.update_features(track.player_name, frame, track.bbox)
+                # Apply strict ID consistency enforcement
+                consistent_id = self.enforce_id_consistency(track, track.player_name)
+                
+                # Check if this ID has been used already (prevent duplicates)
+                if consistent_id in player_id_used:
+                    print(f"WARNING: Duplicate player ID {consistent_id} detected!")
+                    # Find a conflict resolution based on confidence
+                    # For now, skip this track to avoid duplicate IDs
+                    continue
+                
+                # Apply the consistent ID
+                track.set_player_name(consistent_id)
+                player_id_used.add(consistent_id)
+                
+                # Don't update features after initialization - we'll use the initial features only
+                # Comment out the feature updating code
+                # if not self.person_reid.use_reference_only:
+                #     self.person_reid.update_features(consistent_id, frame, track.bbox)
                 
                 # Update player info dictionary
-                player_info[track.player_name] = {
+                player_info[consistent_id] = {
                     'track_id': track.id,
-                    'name': track.player_name,
+                    'name': consistent_id,
                     'bbox': track.bbox
                 }
+                
+                final_tracks.append(track)
+            else:
+                # Keep unidentified tracks for the second pass
+                final_tracks.append(track)
+                
+        # Ensure all reference identities are maintained if tracks exist
+        if self.using_reference_embeddings and len(final_tracks) >= len(self.locked_identities):
+            missing_ids = self.locked_identities - player_id_used
+            
+            if missing_ids:
+                print(f"Warning: Missing locked identities: {missing_ids}")
+                # Try to assign missing IDs to unidentified tracks
+                for missing_id in missing_ids:
+                    for track in final_tracks:
+                        if not track.player_name:
+                            # Try to identify with a lower threshold
+                            similarity = self.person_reid.calculate_similarity(
+                                frame, track.bbox, missing_id)
+                            
+                            if similarity > 0.2:  # Very permissive threshold for recovery
+                                print(f"Recovering missing ID {missing_id} for track {track.id} with similarity {similarity:.2f}")
+                                track.set_player_name(missing_id)
+                                player_id_used.add(missing_id)
+                                
+                                # Update player info
+                                player_info[missing_id] = {
+                                    'track_id': track.id,
+                                    'name': missing_id,
+                                    'bbox': track.bbox
+                                }
+                                break
         
         # Apply temporal consistency filtering to remove false detections
         active_tracks = self._apply_temporal_consistency(active_tracks, frame.shape[:2])
@@ -355,14 +610,14 @@ class SquashPlayerTracker:
     
     def _apply_temporal_consistency(self, tracks, frame_shape):
         """
-        Apply temporal consistency filtering to remove false detections caused by glass
+        Apply temporal consistency filtering and median filtering for smooth tracking
         
         Args:
             tracks: List of active tracks
             frame_shape: Shape of the frame (height, width)
             
         Returns:
-            filtered_tracks: List of temporally consistent tracks
+            filtered_tracks: List of temporally consistent tracks with smoothed positions
         """
         height, width = frame_shape
         
@@ -373,7 +628,9 @@ class SquashPlayerTracker:
                 'id': track.id,
                 'bbox': track.bbox,
                 'name': track.player_name,
-                'center': ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
+                'center': ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2),
+                'width': track.bbox[2] - track.bbox[0],
+                'height': track.bbox[3] - track.bbox[1]
             })
         
         # Add to history (keep only last N frames)
@@ -385,8 +642,10 @@ class SquashPlayerTracker:
         if len(self.valid_track_history) < 2:
             return tracks
         
-        # Filter tracks based on temporal consistency
+        # Filter tracks based on temporal consistency and apply median filtering
         filtered_tracks = []
+        smoothed_tracks = {}  # Will store median-filtered track data
+        
         for track in tracks:
             track_id = track.id
             track_center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
@@ -412,10 +671,56 @@ class SquashPlayerTracker:
                                 consistency_score -= 0.5
                         prev_center = t['center']
             
+            # Collect historical positions for this track for median filtering
+            if track_id not in smoothed_tracks:
+                smoothed_tracks[track_id] = {
+                    'x_positions': [],
+                    'y_positions': [],
+                    'widths': [],
+                    'heights': [],
+                    'original_track': track
+                }
+            
+            # Collect positions from track history (including current frame)
+            for frame_tracks in self.valid_track_history:
+                for t in frame_tracks:
+                    if t['id'] == track_id:
+                        smoothed_tracks[track_id]['x_positions'].append(t['center'][0])
+                        smoothed_tracks[track_id]['y_positions'].append(t['center'][1])
+                        smoothed_tracks[track_id]['widths'].append(t['width'])
+                        smoothed_tracks[track_id]['heights'].append(t['height'])
+            
             # Glass often causes duplicate detections that appear and disappear
             # Only keep tracks that have consistency
             if consistency_score >= 1 or track.hits > 5:
-                filtered_tracks.append(track)
+                # Don't add to filtered_tracks yet, we'll add the smoothed versions later
+                pass
+            else:
+                # Skip this track as it's not consistent enough
+                continue
+        
+        # Apply median filtering to consistent tracks
+        for track_id, track_data in smoothed_tracks.items():
+            if len(track_data['x_positions']) >= 2:  # Need at least 2 points for median
+                # Apply median filter to positions and size
+                med_x = int(np.median(track_data['x_positions']))
+                med_y = int(np.median(track_data['y_positions']))
+                med_w = int(np.median(track_data['widths']))
+                med_h = int(np.median(track_data['heights']))
+                
+                # Reconstruct bbox from median-filtered values
+                x1 = med_x - med_w // 2
+                y1 = med_y - med_h // 2
+                x2 = x1 + med_w
+                y2 = y1 + med_h
+                
+                # Update the track with median-filtered position
+                original_track = track_data['original_track']
+                # Use the update method with is_smoothed=True to avoid double counting hits
+                original_track.update((x1, y1, x2, y2), is_smoothed=True)
+                
+                # Add the smoothed track to filtered_tracks
+                filtered_tracks.append(original_track)
         
         # If filtering removed all tracks but we had tracks before, keep some previous ones
         if not filtered_tracks and self.last_valid_tracks:
@@ -433,7 +738,8 @@ class SquashPlayerTracker:
                     
                     if dist < width * 0.2:  # If within 20% of frame width
                         # Update position but keep ID and name
-                        prev_track.update(track.bbox)
+                        # Use is_smoothed=False since this is a regular update
+                        prev_track.update(track.bbox, is_smoothed=False)
                         filtered_tracks.append(prev_track)
                         break
         
@@ -442,7 +748,7 @@ class SquashPlayerTracker:
         
         return filtered_tracks
         
-    def process_video(self, video_path, output_path=None, display=True):
+    def process_video(self, video_path, output_path=None, display=True, max_display_width=None, max_display_height=None):
         """
         Process a video file
         
@@ -450,7 +756,17 @@ class SquashPlayerTracker:
             video_path: Path to input video
             output_path: Path to save output video (if None, don't save)
             display: Whether to display the processed frames
+            max_display_width: Maximum width for display window (auto-detected if None)
+            max_display_height: Maximum height for display window (auto-detected if None)
         """
+        # Auto-detect screen size if not provided
+        if max_display_width is None or max_display_height is None:
+            screen_width, screen_height = get_screen_resolution()
+            # Use 80% of screen size as maximum display size
+            max_display_width = max_display_width or int(screen_width * 0.8)
+            max_display_height = max_display_height or int(screen_height * 0.8)
+            print(f"Auto-detected display size: {max_display_width}x{max_display_height}")
+        
         # Open video file
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -493,10 +809,51 @@ class SquashPlayerTracker:
             
             # Display processed frame
             if display:
-                cv2.imshow('Player Tracking', processed_frame)
+                # Resize display frame to fit screen if needed
+                display_frame = processed_frame.copy()
+                frame_h, frame_w = display_frame.shape[:2]
+                
+                # Calculate scaling factor to fit within max dimensions while preserving aspect ratio
+                scale_w = min(1.0, max_display_width / frame_w)
+                scale_h = min(1.0, max_display_height / frame_h)
+                scale = min(scale_w, scale_h)  # Use the smaller scale to ensure it fits both dimensions
+                
+                # Only resize if needed (scale < 1.0)
+                if scale < 1.0:
+                    new_width = int(frame_w * scale)
+                    new_height = int(frame_h * scale)
+                    display_frame = cv2.resize(display_frame, (new_width, new_height), 
+                                              interpolation=cv2.INTER_AREA)
+                    
+                    # Add info about resizing
+                    resize_info = f"Display resized: {frame_w}x{frame_h} -> {new_width}x{new_height}"
+                    cv2.putText(display_frame, resize_info, (10, 20), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    
+                # Add keyboard controls info
+                controls_info = "ESC: Exit | F: Toggle Fullscreen | +/-: Resize"
+                cv2.putText(display_frame, controls_info, (10, display_frame.shape[0] - 10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
+                # Create a named window that can be resized by the user if needed
+                cv2.namedWindow('Player Tracking', cv2.WINDOW_NORMAL)
+                cv2.imshow('Player Tracking', display_frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27:  # ESC key
                     break
+                elif key == ord('f'):  # 'f' key to toggle fullscreen
+                    if cv2.getWindowProperty('Player Tracking', cv2.WND_PROP_FULLSCREEN) == cv2.WINDOW_FULLSCREEN:
+                        cv2.setWindowProperty('Player Tracking', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                    else:
+                        cv2.setWindowProperty('Player Tracking', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                elif key == ord('+') or key == ord('='):  # Increase display size
+                    current_width = int(cv2.getWindowProperty('Player Tracking', cv2.WND_PROP_WIDTH))
+                    current_height = int(cv2.getWindowProperty('Player Tracking', cv2.WND_PROP_HEIGHT))
+                    cv2.resizeWindow('Player Tracking', int(current_width * 1.1), int(current_height * 1.1))
+                elif key == ord('-') or key == ord('_'):  # Decrease display size
+                    current_width = int(cv2.getWindowProperty('Player Tracking', cv2.WND_PROP_WIDTH))
+                    current_height = int(cv2.getWindowProperty('Player Tracking', cv2.WND_PROP_HEIGHT))
+                    cv2.resizeWindow('Player Tracking', int(current_width * 0.9), int(current_height * 0.9))
             
             # Write frame to output video
             if writer:
