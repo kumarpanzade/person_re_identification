@@ -11,10 +11,10 @@ class DeepSORTTracker:
         self,
         max_age: int = 90,  # Increased from 60 to keep tracks alive longer during occlusions
         min_hits: int = 2,
-        iou_threshold: float = 0.15,
-        embedder: str = "mobilenet",
+        iou_threshold: float = 0.1,
+        embedder: str = "torchreid",
         half: bool = False,
-        n_init: int = 2,
+        n_init: int = 4,
     ):
         # DeepSort ctor parameters map
         # - max_age: tracks are deleted if not updated in this many frames
@@ -23,19 +23,19 @@ class DeepSORTTracker:
         self.ds = DeepSort(
             max_age=max_age,
             n_init=n_init,
-            max_iou_distance=max(0.01, iou_threshold),  # keep small but >0
-            max_cosine_distance=0.4,  # More permissive appearance matching (default is 0.2)
+            max_iou_distance=max(0.1, iou_threshold),  # keep small but >0
+            max_cosine_distance=0.8,  # More permissive appearance matching (default is 0.2)
             nn_budget=100,  # Larger appearance descriptor budget
             embedder=embedder,  # 'mobilenet' is lightweight
             half=half,
             bgr=True,  # our frames are BGR (OpenCV)
-            embedder_gpu=False,  # set True if you want GPU for embedder
+            embedder_gpu=True,  # set True if you want GPU for embedder
         )
 
         self.min_hits = min_hits
         self.max_age = max_age
         self.max_tracks = None  # No limit on maximum number of tracks to maintain
-        self.nms_distance_threshold = 50  # Pixel distance threshold for NMS between tracks
+        self.nms_distance_threshold = 80  # Pixel distance threshold for NMS between tracks
 
         # Map DeepSORT track_id -> our Track
         self._id_map: Dict[int, Track] = {}
@@ -129,6 +129,41 @@ class DeepSORTTracker:
             
         return intersection / union
     
+    def _calculate_batch_iou(self, bboxes1, bboxes2):
+        """Calculate IoU between two sets of bounding boxes efficiently using vectorized operations"""
+        if len(bboxes1) == 0 or len(bboxes2) == 0:
+            return np.zeros((len(bboxes1), len(bboxes2)))
+        
+        # Convert to numpy arrays for vectorized operations
+        bboxes1 = np.array(bboxes1)
+        bboxes2 = np.array(bboxes2)
+        
+        # Extract coordinates
+        x1_1, y1_1, x2_1, y2_1 = bboxes1[:, 0], bboxes1[:, 1], bboxes1[:, 2], bboxes1[:, 3]
+        x1_2, y1_2, x2_2, y2_2 = bboxes2[:, 0], bboxes2[:, 1], bboxes2[:, 2], bboxes2[:, 3]
+        
+        # Calculate intersection areas using broadcasting
+        xx1 = np.maximum(x1_1[:, np.newaxis], x1_2[np.newaxis, :])
+        yy1 = np.maximum(y1_1[:, np.newaxis], y1_2[np.newaxis, :])
+        xx2 = np.minimum(x2_1[:, np.newaxis], x2_2[np.newaxis, :])
+        yy2 = np.minimum(y2_1[:, np.newaxis], y2_2[np.newaxis, :])
+        
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        intersection = w * h
+        
+        # Calculate areas
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        
+        # Calculate union using broadcasting
+        union = area1[:, np.newaxis] + area2[np.newaxis, :] - intersection
+        
+        # Prevent division by zero
+        union = np.maximum(union, 1e-6)
+        
+        return intersection / union
+    
     def _calculate_center_distance(self, bbox1, bbox2):
         """Calculate distance between centers of two bounding boxes"""
         x1_1, y1_1, x2_1, y2_1 = bbox1
@@ -141,88 +176,195 @@ class DeepSORTTracker:
         # Calculate Euclidean distance
         return np.sqrt((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)
     
+    def _calculate_batch_center_distance(self, bboxes1, bboxes2):
+        """Calculate distances between centers of two sets of bounding boxes efficiently"""
+        if len(bboxes1) == 0 or len(bboxes2) == 0:
+            return np.zeros((len(bboxes1), len(bboxes2)))
+        
+        # Convert to numpy arrays
+        bboxes1 = np.array(bboxes1)
+        bboxes2 = np.array(bboxes2)
+        
+        # Calculate centers
+        centers1 = np.column_stack([
+            (bboxes1[:, 0] + bboxes1[:, 2]) // 2,
+            (bboxes1[:, 1] + bboxes1[:, 3]) // 2
+        ])
+        centers2 = np.column_stack([
+            (bboxes2[:, 0] + bboxes2[:, 2]) // 2,
+            (bboxes2[:, 1] + bboxes2[:, 3]) // 2
+        ])
+        
+        # Calculate distances using broadcasting
+        diff = centers1[:, np.newaxis, :] - centers2[np.newaxis, :, :]
+        distances = np.sqrt(np.sum(diff**2, axis=2))
+        
+        return distances
+    
     def _apply_nms_to_detections(self, detections):
-        """Apply non-maximum suppression to detections"""
+        """Apply non-maximum suppression to detections using optimized vectorized operations"""
         if len(detections) <= 1:
             return detections
         
         # Sort by confidence (higher first)
         detections = sorted(detections, key=lambda x: x[1], reverse=True)
         
-        # NMS
-        keep = []
-        indices = list(range(len(detections)))
+        # Extract bboxes and confidences
+        bboxes = [det[0] for det in detections]
+        confidences = [det[1] for det in detections]
         
-        while indices:
-            # Take the detection with highest confidence
-            current_idx = indices[0]
-            current_bbox = detections[current_idx][0]
-            keep.append(current_idx)
-            indices.pop(0)
+        # Use vectorized NMS for better performance with more aggressive thresholds
+        keep_indices = self._vectorized_nms(bboxes, confidences, iou_threshold=0.3, distance_threshold=30)
+        
+        return [detections[i] for i in keep_indices]
+    
+    def _vectorized_nms(self, bboxes, scores, iou_threshold=0.5, distance_threshold=50):
+        """
+        Vectorized Non-Maximum Suppression for better performance
+        
+        Args:
+            bboxes: List of bounding boxes in xyxy format
+            scores: List of confidence scores
+            iou_threshold: IoU threshold for suppression
+            distance_threshold: Distance threshold for suppression
             
-            # Compare with rest
-            i = 0
-            while i < len(indices):
-                bbox = detections[indices[i]][0]
-                iou = self._calculate_iou(current_bbox, bbox)
-                
-                # If IoU is high or distance is small, they're likely the same object - remove
-                distance = self._calculate_center_distance(current_bbox, bbox)
-                if iou > 0.45 or distance < 40:  # More aggressive NMS for glass reflections
-                    indices.pop(i)
-                else:
-                    i += 1
+        Returns:
+            keep_indices: List of indices to keep after NMS
+        """
+        if len(bboxes) == 0:
+            return []
         
-        return [detections[i] for i in keep]
+        # Convert to numpy arrays
+        bboxes = np.array(bboxes)
+        scores = np.array(scores)
+        
+        # Sort by scores (descending)
+        sorted_indices = np.argsort(scores)[::-1]
+        
+        # Calculate IoU and distance matrices
+        iou_matrix = self._calculate_batch_iou(bboxes, bboxes)
+        distance_matrix = self._calculate_batch_center_distance(bboxes, bboxes)
+        
+        keep = []
+        suppressed = set()
+        
+        for i in sorted_indices:
+            if i in suppressed:
+                continue
+                
+            keep.append(i)
+            
+            # Suppress boxes with high IoU or small distance
+            iou_mask = iou_matrix[i] > iou_threshold
+            distance_mask = distance_matrix[i] < distance_threshold
+            suppress_mask = iou_mask | distance_mask
+            
+            # Add suppressed indices to set
+            for j in np.where(suppress_mask)[0]:
+                if j != i:  # Don't suppress self
+                    suppressed.add(j)
+        
+        return keep
     
     def _apply_nms_to_tracks(self, tracks):
-        """Apply non-maximum suppression to tracks based on IoU and distance"""
+        """Apply non-maximum suppression to tracks using optimized vectorized operations"""
         if len(tracks) <= 1:
             return tracks
         
         # Sort by hits (more hits = more reliable track)
         tracks = sorted(tracks, key=lambda t: t.hits, reverse=True)
         
-        # NMS
-        keep = []
-        indices = list(range(len(tracks)))
+        # Extract bboxes and scores (hits)
+        bboxes = [track.bbox for track in tracks]
+        scores = [track.hits for track in tracks]
         
-        while indices:
-            # Take the track with highest hits
-            current_idx = indices[0]
-            current_track = tracks[current_idx]
-            keep.append(current_idx)
-            indices.pop(0)
+        # Use vectorized NMS with custom thresholds for tracks (more aggressive)
+        keep_indices = self._vectorized_track_nms(tracks, bboxes, scores, 
+                                                iou_threshold=0.3, 
+                                                distance_threshold=40)
+        
+        return [tracks[i] for i in keep_indices]
+    
+    def _vectorized_track_nms(self, tracks, bboxes, scores, iou_threshold=0.4, distance_threshold=80):
+        """
+        Vectorized NMS specifically for tracks with player name transfer logic
+        
+        Args:
+            tracks: List of Track objects
+            bboxes: List of bounding boxes
+            scores: List of hit scores
+            iou_threshold: IoU threshold for suppression
+            distance_threshold: Distance threshold for suppression
             
-            # Compare with rest
-            i = 0
-            while i < len(indices):
-                track = tracks[indices[i]]
-                
-                # Calculate both IoU and center distance
-                iou = self._calculate_iou(current_track.bbox, track.bbox)
-                distance = self._calculate_center_distance(current_track.bbox, track.bbox)
-                
-                # More aggressive merging for glass reflections
-                # Check IoU, distance, and also size similarity (reflections often have similar size)
-                w1, h1 = current_track.bbox[2]-current_track.bbox[0], current_track.bbox[3]-current_track.bbox[1]
-                w2, h2 = track.bbox[2]-track.bbox[0], track.bbox[3]-track.bbox[1]
-                size_ratio = min(w1/w2 if w2 > 0 else 0, w2/w1 if w1 > 0 else 0) * min(h1/h2 if h2 > 0 else 0, h2/h1 if h1 > 0 else 0)
-                
-                if iou > 0.4 or distance < self.nms_distance_threshold or (distance < self.nms_distance_threshold*2 and size_ratio > 0.7):
-                    # The tracks are likely the same person
-                    # If the current track has a player name and the other doesn't, transfer it
-                    if current_track.player_name and not track.player_name:
-                        track.set_player_name(current_track.player_name)
-                    # If the other track has a player name and the current doesn't, transfer it
-                    elif not current_track.player_name and track.player_name:
-                        current_track.set_player_name(track.player_name)
-                    
-                    indices.pop(i)
-                else:
-                    i += 1
+        Returns:
+            keep_indices: List of indices to keep after NMS
+        """
+        if len(bboxes) == 0:
+            return []
         
-        return [tracks[i] for i in keep]
+        # Convert to numpy arrays
+        bboxes = np.array(bboxes)
+        scores = np.array(scores)
+        
+        # Sort by scores (descending)
+        sorted_indices = np.argsort(scores)[::-1]
+        
+        # Calculate IoU and distance matrices
+        iou_matrix = self._calculate_batch_iou(bboxes, bboxes)
+        distance_matrix = self._calculate_batch_center_distance(bboxes, bboxes)
+        
+        # Calculate size similarity matrix for glass reflection detection
+        size_similarity = self._calculate_size_similarity_matrix(bboxes)
+        
+        keep = []
+        suppressed = set()
+        
+        for i in sorted_indices:
+            if i in suppressed:
+                continue
+                
+            keep.append(i)
+            current_track = tracks[i]
+            
+            # Suppress boxes with high IoU, small distance, or similar size
+            iou_mask = iou_matrix[i] > iou_threshold
+            distance_mask = distance_matrix[i] < distance_threshold
+            size_mask = (distance_matrix[i] < distance_threshold * 2) & (size_similarity[i] > 0.7)
+            suppress_mask = iou_mask | distance_mask | size_mask
+            
+            # Add suppressed indices to set and transfer player names
+            for j in np.where(suppress_mask)[0]:
+                if j != i:  # Don't suppress self
+                    suppressed.add(j)
+                    track_j = tracks[j]
+                    
+                    # Transfer player names between merged tracks
+                    if current_track.player_name and not track_j.player_name:
+                        track_j.set_player_name(current_track.player_name)
+                    elif not current_track.player_name and track_j.player_name:
+                        current_track.set_player_name(track_j.player_name)
+        
+        return keep
+    
+    def _calculate_size_similarity_matrix(self, bboxes):
+        """Calculate size similarity matrix for glass reflection detection"""
+        if len(bboxes) == 0:
+            return np.zeros((0, 0))
+        
+        # Calculate widths and heights
+        widths = bboxes[:, 2] - bboxes[:, 0]
+        heights = bboxes[:, 3] - bboxes[:, 1]
+        
+        # Calculate size ratios using broadcasting
+        w_ratios = np.minimum(widths[:, np.newaxis] / (widths[np.newaxis, :] + 1e-6),
+                             widths[np.newaxis, :] / (widths[:, np.newaxis] + 1e-6))
+        h_ratios = np.minimum(heights[:, np.newaxis] / (heights[np.newaxis, :] + 1e-6),
+                             heights[np.newaxis, :] / (heights[:, np.newaxis] + 1e-6))
+        
+        # Size similarity is the product of width and height ratios
+        size_similarity = w_ratios * h_ratios
+        
+        return size_similarity
 
     def _filter_tracks_by_motion(self, tracks):
         """

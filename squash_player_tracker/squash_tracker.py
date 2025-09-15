@@ -11,7 +11,7 @@ from typing import List, Dict, Tuple, Optional
 from squash_player_tracker.core.person_detection import PersonDetector
 from squash_player_tracker.core.person_reid import PersonReID
 from squash_player_tracker.core.deepsort_tracker import DeepSORTTracker
-from squash_player_tracker.utils.visualization import draw_player_info, create_summary_image
+from squash_player_tracker.utils.visualization import draw_player_info
 try:
     from torchreid.utils import FeatureExtractor
 except Exception:
@@ -38,7 +38,9 @@ def get_screen_resolution():
         return 1280, 720
 
 class SquashPlayerTracker:
-    def __init__(self, detection_conf=0.6, reid_threshold=0.6, use_gpu=True, reference_embeddings=None):
+    def __init__(self, detection_conf=0.6, reid_threshold=0.6, use_gpu=True, reference_embeddings=None, 
+                 duplicate_iou_threshold=0.3, duplicate_distance_threshold=30, debug_duplicates=False, 
+                 debug_crossing=False, max_players=2):
         """
         Initialize the squash player tracking system.
         
@@ -47,6 +49,8 @@ class SquashPlayerTracker:
             reid_threshold: Similarity threshold for person re-identification
             use_gpu: Whether to use GPU for inference
             reference_embeddings: Optional dictionary of pre-defined person embeddings
+            duplicate_iou_threshold: IoU threshold for detecting duplicate detections
+            duplicate_distance_threshold: Distance threshold for detecting duplicate detections
         """
         print("Initializing Squash Player Tracker...")
         
@@ -70,12 +74,12 @@ class SquashPlayerTracker:
         
         # Add temporal consistency tracking with median filtering for smooth tracking
         self.last_valid_tracks = []
-        self.consistency_window = 5  # Number of frames to use for median filtering
+        self.consistency_window = 10  # Number of frames to use for median filtering
         self.valid_track_history = []  # Track positions over time used for median filtering
         
         # Track player ID consistency
         self.player_track_history = {}  # Map player ID to their track history
-        self.reid_memory_frames = 60  # Remember player associations for 30 frames
+        self.reid_memory_frames = 10000  # Remember player associations for 30 frames
         self.player_positions = {}  # Last known positions of players
         
         # Direct mapping of track IDs to player IDs for stronger consistency
@@ -89,6 +93,20 @@ class SquashPlayerTracker:
         
         # Track which players have had their features initialized
         self.initialized_features = set()
+        
+        # Duplicate detection thresholds
+        self.duplicate_iou_threshold = duplicate_iou_threshold
+        self.duplicate_distance_threshold = duplicate_distance_threshold
+        self.debug_duplicates = debug_duplicates
+        self.debug_crossing = debug_crossing
+        self.max_players = max_players
+        
+        # Crossing detection and ID preservation
+        self.player_motion_history = {}  # Store motion vectors for each player
+        self.crossing_detected = False
+        self.crossing_frames = 0
+        self.max_crossing_frames = 60  # Maximum frames to consider as crossing
+        self.motion_prediction_weight = 0.8  # Weight for motion prediction vs appearance
         
         # Initialize with reference embeddings if provided
         if reference_embeddings:
@@ -276,8 +294,30 @@ class SquashPlayerTracker:
                 except Exception as e:
                     print(f"Error validating detection {i}: {e}")
             
+            # Apply additional duplicate detection before tracking
+            valid_detections = self._remove_duplicate_detections(valid_detections)
+            
             # Update tracker with validated detections (DeepSORT benefits from the frame)
             active_tracks = self.tracker.update(valid_detections, frame=frame)
+            
+            # Apply additional duplicate detection after tracking
+            active_tracks = self._remove_duplicate_tracks(active_tracks)
+            
+            # Update motion history for crossing detection
+            self._update_motion_history(active_tracks)
+            
+            # Detect crossing events
+            self.crossing_detected = self._detect_crossing(active_tracks)
+            if self.crossing_detected:
+                self.crossing_frames += 1
+                if self.debug_crossing:
+                    print(f"CROSSING DETECTED - Frame {self.crossing_frames}")
+            else:
+                self.crossing_frames = 0
+                
+            # Preserve IDs during crossing
+            active_tracks = self._preserve_ids_during_crossing(active_tracks)
+            
         except Exception as e:
             print(f"Error in detection/tracking pipeline: {e}")
             active_tracks = []
@@ -337,52 +377,90 @@ class SquashPlayerTracker:
             
             print(f"Using pre-defined embeddings - identified tracks: {len([t for t in active_tracks if t.player_name])}")
         else:
-            # HARD RESET: Force assignment of unique IDs P1, P2, P3, etc. to tracks
-            # This is the original behavior when not using reference embeddings
-            
-            # First collect all tracks (both named and unnamed)
-            all_tracks = []
-            for track in active_tracks:
-                track_center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
-                track_area = (track.bbox[2] - track.bbox[0]) * (track.bbox[3] - track.bbox[1])
-                all_tracks.append({
-                    'track': track,
-                    'center': track_center,
-                    'area': track_area,
-                    'hits': track.hits
-                })
-            
-            # Sort tracks by reliability (more hits = more reliable)
-            all_tracks.sort(key=lambda x: x['hits'], reverse=True)
-            
-            # Sort tracks by horizontal position (left to right)
-            # This ensures consistent assignment based on position
-            all_tracks.sort(key=lambda x: x['center'][0])
-            
-            # Generate player IDs dynamically based on the number of tracks
-            player_ids = [f"P{i+1}" for i in range(len(all_tracks))]
-            
-            print(f"RESETTING ALL PLAYER IDS - tracks: {len(all_tracks)}")
-            for i, track_data in enumerate(all_tracks):
-                if i < len(player_ids):  # Ensure we don't exceed available IDs
+            # ID assignment strategy based on crossing detection
+            if self.crossing_detected and self.crossing_frames < self.max_crossing_frames:
+                # During crossing: Preserve existing IDs and only assign new ones to truly new tracks
+                if self.debug_crossing:
+                    print(f"CROSSING MODE: Preserving existing IDs (frame {self.crossing_frames})")
+                
+                # Only assign IDs to tracks that don't have them
+                unnamed_tracks = [t for t in active_tracks if not t.player_name]
+                if unnamed_tracks:
+                    # Sort by hits and assign IDs to new tracks
+                    unnamed_tracks.sort(key=lambda t: t.hits, reverse=True)
+                    for i, track in enumerate(unnamed_tracks):
+                        if i < self.max_players:  # Support up to max_players
+                            player_id = f"P{len([t for t in active_tracks if t.player_name]) + i + 1}"
+                            track.set_player_name(player_id)
+                            self.track_to_player_map[track.id] = player_id
+                            self.player_to_track_map[player_id] = track.id
+                            self.ensure_features_initialized_once(player_id, frame, track.bbox)
+                            print(f"CROSSING: Assigned new ID {player_id} to track {track.id}")
+            else:
+                # Normal mode: Use motion prediction and appearance for ID assignment
+                if self.debug_crossing:
+                    print("NORMAL MODE: Using motion prediction and appearance for ID assignment")
+                
+                # First collect all tracks (both named and unnamed)
+                all_tracks = []
+                for track in active_tracks:
+                    track_center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
+                    track_area = (track.bbox[2] - track.bbox[0]) * (track.bbox[3] - track.bbox[1])
+                    all_tracks.append({
+                        'track': track,
+                        'center': track_center,
+                        'area': track_area,
+                        'hits': track.hits
+                    })
+                
+                # Sort tracks by reliability (more hits = more reliable)
+                all_tracks.sort(key=lambda x: x['hits'], reverse=True)
+                
+                # For tracks without IDs, try to match with previous positions using motion prediction
+                for track_data in all_tracks:
                     track = track_data['track']
-                    player_id = player_ids[i]
+                    if not track.player_name:
+                        # Try to match with previous player positions
+                        best_match = None
+                        best_score = float('inf')
+                        
+                        for player_id, data in self.player_positions.items():
+                            # Skip if player is already assigned to another track
+                            if player_id in [t.player_name for t in active_tracks if t.player_name]:
+                                continue
+                                
+                            # Get predicted position
+                            predicted_pos = self._predict_motion(player_id, data['center'])
+                            
+                            # Calculate distance to predicted position
+                            track_center = track_data['center']
+                            distance = np.sqrt((track_center[0] - predicted_pos[0])**2 + 
+                                             (track_center[1] - predicted_pos[1])**2)
+                            
+                            if distance < best_score and distance < 80:  # Reverted to 2-player threshold
+                                best_score = distance
+                                best_match = player_id
+                        
+                        if best_match:
+                            track.set_player_name(best_match)
+                            self.track_to_player_map[track.id] = best_match
+                            self.player_to_track_map[best_match] = track.id
+                            print(f"MOTION MATCH: {best_match} -> track {track.id} (distance: {best_score:.1f})")
+                
+                # Assign remaining IDs to tracks without names
+                unnamed_tracks = [t for t in active_tracks if not t.player_name]
+                if unnamed_tracks:
+                    # Sort by horizontal position for consistent assignment
+                    unnamed_tracks.sort(key=lambda t: ((t.bbox[0] + t.bbox[2]) // 2))
                     
-                    # Only log if the ID is changing
-                    if track.player_name != player_id:
-                        old_id = track.player_name if track.player_name else "None"
-                        print(f"FORCE ASSIGNING: {old_id} -> {player_id} for track {track.id}")
-                    
-                    # Force set the ID
-                    track.set_player_name(player_id)
-                    
-                    # Update our direct track-to-player mapping
-                    self.track_to_player_map[track.id] = player_id
-                    self.player_to_track_map[player_id] = track.id
-                    
-                    # Store features only once at initialization if they don't exist already
-                    self.ensure_features_initialized_once(player_id, frame, track.bbox)
-                    # We'll use the initial features for future identification
+                    for i, track in enumerate(unnamed_tracks):
+                        if i < self.max_players:  # Support up to max_players
+                            player_id = f"P{i+1}"
+                            track.set_player_name(player_id)
+                            self.track_to_player_map[track.id] = player_id
+                            self.player_to_track_map[player_id] = track.id
+                            self.ensure_features_initialized_once(player_id, frame, track.bbox)
+                            print(f"NEW ASSIGNMENT: {player_id} -> track {track.id}")
         
         # Apply our enhanced ID consistency enforcement to all tracks
         final_tracks = []
@@ -396,9 +474,9 @@ class SquashPlayerTracker:
                 
                 # Check if this ID has been used already (prevent duplicates)
                 if consistent_id in player_id_used:
-                    print(f"WARNING: Duplicate player ID {consistent_id} detected!")
-                    # Find a conflict resolution based on confidence
-                    # For now, skip this track to avoid duplicate IDs
+                    print(f"WARNING: Duplicate player ID {consistent_id} detected! Removing track {track.id}")
+                    # Reset the track's player name to prevent duplicate IDs
+                    track.player_name = None
                     continue
                 
                 # Apply the consistent ID
@@ -449,8 +527,17 @@ class SquashPlayerTracker:
                                 }
                                 break
         
-        # Apply temporal consistency filtering to remove false detections
+        # Apply temporal consistency filtering to remove false detections and duplicates
         active_tracks = self._apply_temporal_consistency(active_tracks, frame.shape[:2])
+        
+        # Limit to maximum tracks based on max_players setting
+        if len(active_tracks) > self.max_players:
+            # Sort by hits and keep only the most reliable tracks
+            active_tracks = sorted(active_tracks, key=lambda t: t.hits, reverse=True)[:self.max_players]
+            print(f"Limited tracks to {self.max_players} most reliable ones (was {len(active_tracks)})")
+        
+        # Final aggressive duplicate detection before output
+        active_tracks = self._final_duplicate_cleanup(active_tracks)
         
         # Update player info with filtered tracks
         player_info = {}
@@ -691,12 +778,13 @@ class SquashPlayerTracker:
                         smoothed_tracks[track_id]['heights'].append(t['height'])
             
             # Glass often causes duplicate detections that appear and disappear
-            # Only keep tracks that have consistency
-            if consistency_score >= 1 or track.hits > 5:
+            # Only keep tracks that have consistency (more aggressive filtering)
+            if consistency_score >= 2 or track.hits > 8:  # Increased thresholds
                 # Don't add to filtered_tracks yet, we'll add the smoothed versions later
                 pass
             else:
                 # Skip this track as it's not consistent enough
+                print(f"Removing inconsistent track {track.id} (consistency: {consistency_score}, hits: {track.hits})")
                 continue
         
         # Apply median filtering to consistent tracks
@@ -747,6 +835,368 @@ class SquashPlayerTracker:
         self.last_valid_tracks = filtered_tracks.copy()
         
         return filtered_tracks
+    
+    def _remove_duplicate_detections(self, detections):
+        """
+        Remove duplicate detections using IoU and distance thresholds
+        
+        Args:
+            detections: List of (bbox, confidence) tuples
+            
+        Returns:
+            filtered_detections: List of detections with duplicates removed
+        """
+        if len(detections) <= 1:
+            return detections
+            
+        # Sort by confidence (higher first)
+        detections = sorted(detections, key=lambda x: x[1], reverse=True)
+        
+        filtered_detections = []
+        
+        for i, (bbox1, conf1) in enumerate(detections):
+            is_duplicate = False
+            
+            # Check against already filtered detections
+            for j, (bbox2, conf2) in enumerate(filtered_detections):
+                # Calculate IoU
+                iou = self._calculate_iou(bbox1, bbox2)
+                
+                # Calculate center distance
+                center1 = ((bbox1[0] + bbox1[2]) // 2, (bbox1[1] + bbox1[3]) // 2)
+                center2 = ((bbox2[0] + bbox2[2]) // 2, (bbox2[1] + bbox2[3]) // 2)
+                distance = np.sqrt((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)
+                
+                # Check if this is a duplicate
+                if iou > self.duplicate_iou_threshold or distance < self.duplicate_distance_threshold:
+                    is_duplicate = True
+                    if self.debug_duplicates:
+                        print(f"Removing duplicate detection: IoU={iou:.2f}, distance={distance:.1f}")
+                    break
+            
+            if not is_duplicate:
+                filtered_detections.append((bbox1, conf1))
+        
+        print(f"Filtered {len(detections)} detections to {len(filtered_detections)} (removed {len(detections) - len(filtered_detections)} duplicates)")
+        return filtered_detections
+    
+    def _calculate_iou(self, bbox1, bbox2):
+        """Calculate IoU between two bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        
+        # Calculate intersection area
+        xx1 = max(x1_1, x1_2)
+        yy1 = max(y1_1, y1_2)
+        xx2 = min(x2_1, x2_2)
+        yy2 = min(y2_1, y2_2)
+        
+        w = max(0, xx2 - xx1)
+        h = max(0, yy2 - yy1)
+        intersection = w * h
+        
+        # Calculate union area
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        # Prevent division by zero
+        if union == 0:
+            return 0
+            
+        return intersection / union
+    
+    def _remove_duplicate_tracks(self, tracks):
+        """
+        Remove duplicate tracks that are tracking the same person
+        
+        Args:
+            tracks: List of active tracks
+            
+        Returns:
+            filtered_tracks: List of tracks with duplicates removed
+        """
+        if len(tracks) <= 1:
+            return tracks
+            
+        # Sort by hits (more reliable tracks first)
+        tracks = sorted(tracks, key=lambda t: t.hits, reverse=True)
+        
+        filtered_tracks = []
+        
+        for i, track1 in enumerate(tracks):
+            is_duplicate = False
+            
+            # Check against already filtered tracks
+            for j, track2 in enumerate(filtered_tracks):
+                # Calculate IoU
+                iou = self._calculate_iou(track1.bbox, track2.bbox)
+                
+                # Calculate center distance
+                center1 = ((track1.bbox[0] + track1.bbox[2]) // 2, (track1.bbox[1] + track1.bbox[3]) // 2)
+                center2 = ((track2.bbox[0] + track2.bbox[2]) // 2, (track2.bbox[1] + track2.bbox[3]) // 2)
+                distance = np.sqrt((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)
+                
+                # Check if this is a duplicate track
+                if iou > self.duplicate_iou_threshold or distance < self.duplicate_distance_threshold:
+                    is_duplicate = True
+                    if self.debug_duplicates:
+                        print(f"Removing duplicate track {track1.id} (IoU={iou:.2f}, distance={distance:.1f})")
+                    
+                    # Transfer player name if track1 has one and track2 doesn't
+                    if track1.player_name and not track2.player_name:
+                        track2.set_player_name(track1.player_name)
+                        if self.debug_duplicates:
+                            print(f"Transferred player name {track1.player_name} from track {track1.id} to track {track2.id}")
+                    break
+            
+            if not is_duplicate:
+                filtered_tracks.append(track1)
+        
+        print(f"Filtered {len(tracks)} tracks to {len(filtered_tracks)} (removed {len(tracks) - len(filtered_tracks)} duplicates)")
+        return filtered_tracks
+    
+    def _final_duplicate_cleanup(self, tracks):
+        """
+        Final aggressive cleanup to remove any remaining duplicate tracks
+        This is the last line of defense against duplicate bounding boxes
+        
+        Args:
+            tracks: List of active tracks
+            
+        Returns:
+            cleaned_tracks: List of tracks with all duplicates removed
+        """
+        if len(tracks) <= 1:
+            return tracks
+            
+        # Sort by hits and confidence (most reliable first)
+        tracks = sorted(tracks, key=lambda t: (t.hits, getattr(t, 'confidence', 0)), reverse=True)
+        
+        cleaned_tracks = []
+        
+        for i, track1 in enumerate(tracks):
+            is_duplicate = False
+            
+            # Check against already cleaned tracks
+            for j, track2 in enumerate(cleaned_tracks):
+                # Calculate IoU
+                iou = self._calculate_iou(track1.bbox, track2.bbox)
+                
+                # Calculate center distance
+                center1 = ((track1.bbox[0] + track1.bbox[2]) // 2, (track1.bbox[1] + track1.bbox[3]) // 2)
+                center2 = ((track2.bbox[0] + track2.bbox[2]) // 2, (track2.bbox[1] + track2.bbox[3]) // 2)
+                distance = np.sqrt((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)
+                
+                # Reverted to 2-player thresholds (more aggressive)
+                if iou > 0.3 or distance < 15:  # Reverted to 2-player settings
+                    is_duplicate = True
+                    if self.debug_duplicates:
+                        print(f"FINAL CLEANUP: Removing duplicate track {track1.id} (IoU={iou:.2f}, distance={distance:.1f})")
+                    
+                    # Transfer player name if track1 has one and track2 doesn't
+                    if track1.player_name and not track2.player_name:
+                        track2.set_player_name(track1.player_name)
+                        if self.debug_duplicates:
+                            print(f"Transferred player name {track1.player_name} from track {track1.id} to track {track2.id}")
+                    break
+            
+            if not is_duplicate:
+                cleaned_tracks.append(track1)
+        
+        print(f"FINAL CLEANUP: Filtered {len(tracks)} tracks to {len(cleaned_tracks)} (removed {len(tracks) - len(cleaned_tracks)} duplicates)")
+        return cleaned_tracks
+    
+    def _detect_crossing(self, tracks):
+        """
+        Detect if players are crossing each other based on motion vectors
+        
+        Args:
+            tracks: List of current tracks
+            
+        Returns:
+            bool: True if crossing is detected
+        """
+        if len(tracks) < 2:
+            return False
+            
+        # Get current positions
+        current_positions = {}
+        for track in tracks:
+            if track.player_name:
+                center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
+                current_positions[track.player_name] = center
+        
+        # Check if we have motion history for at least 2 players
+        if len(current_positions) < 2 or len(self.player_motion_history) < 2:
+            return False
+            
+        # Calculate motion vectors
+        motion_vectors = {}
+        for player_id, current_pos in current_positions.items():
+            if player_id in self.player_motion_history:
+                prev_pos = self.player_motion_history[player_id]['position']
+                motion_vectors[player_id] = (
+                    current_pos[0] - prev_pos[0],
+                    current_pos[1] - prev_pos[1]
+                )
+        
+        if len(motion_vectors) < 2:
+            return False
+            
+        # Check for crossing by analyzing motion vectors
+        player_ids = list(motion_vectors.keys())
+        for i in range(len(player_ids)):
+            for j in range(i + 1, len(player_ids)):
+                player1, player2 = player_ids[i], player_ids[j]
+                pos1, pos2 = current_positions[player1], current_positions[player2]
+                vel1, vel2 = motion_vectors[player1], motion_vectors[player2]
+                
+                # Calculate distance between players
+                distance = np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+                
+                # Check if players are close and moving towards each other
+                if distance < 100:  # Reverted to 2-player threshold
+                    # Calculate dot product of velocity vectors
+                    dot_product = vel1[0] * vel2[0] + vel1[1] * vel2[1]
+                    
+                    # If dot product is negative, players are moving towards each other
+                    if dot_product < 0:
+                        return True
+                        
+        return False
+    
+    def _predict_motion(self, player_id, current_pos):
+        """
+        Predict next position based on motion history
+        
+        Args:
+            player_id: ID of the player
+            current_pos: Current position (x, y)
+            
+        Returns:
+            tuple: Predicted position (x, y)
+        """
+        if player_id not in self.player_motion_history:
+            return current_pos
+            
+        history = self.player_motion_history[player_id]
+        if len(history['positions']) < 2:
+            return current_pos
+            
+        # Calculate average velocity
+        velocities = []
+        for i in range(1, len(history['positions'])):
+            prev_pos = history['positions'][i-1]
+            curr_pos = history['positions'][i]
+            vel = (curr_pos[0] - prev_pos[0], curr_pos[1] - prev_pos[1])
+            velocities.append(vel)
+            
+        if not velocities:
+            return current_pos
+            
+        # Average velocity
+        avg_vel = (
+            sum(v[0] for v in velocities) / len(velocities),
+            sum(v[1] for v in velocities) / len(velocities)
+        )
+        
+        # Predict next position
+        predicted_pos = (
+            current_pos[0] + avg_vel[0],
+            current_pos[1] + avg_vel[1]
+        )
+        
+        return predicted_pos
+    
+    def _update_motion_history(self, tracks):
+        """
+        Update motion history for all tracks
+        
+        Args:
+            tracks: List of current tracks
+        """
+        for track in tracks:
+            if track.player_name:
+                center = ((track.bbox[0] + track.bbox[2]) // 2, (track.bbox[1] + track.bbox[3]) // 2)
+                
+                if track.player_name not in self.player_motion_history:
+                    self.player_motion_history[track.player_name] = {
+                        'positions': [],
+                        'frames': []
+                    }
+                
+                # Add current position
+                self.player_motion_history[track.player_name]['positions'].append(center)
+                self.player_motion_history[track.player_name]['frames'].append(self.current_frame)
+                
+                # Keep only last 10 positions
+                if len(self.player_motion_history[track.player_name]['positions']) > 10:
+                    self.player_motion_history[track.player_name]['positions'].pop(0)
+                    self.player_motion_history[track.player_name]['frames'].pop(0)
+                
+                # Update position for next frame
+                self.player_motion_history[track.player_name]['position'] = center
+        
+    def _preserve_ids_during_crossing(self, tracks):
+        """
+        Preserve player IDs during crossing events using motion prediction
+        
+        Args:
+            tracks: List of current tracks
+            
+        Returns:
+            tracks: List of tracks with preserved IDs
+        """
+        if not self.crossing_detected or len(tracks) < 2:
+            return tracks
+            
+        # Get tracks with and without IDs
+        named_tracks = [t for t in tracks if t.player_name]
+        unnamed_tracks = [t for t in tracks if not t.player_name]
+        
+        if len(named_tracks) == 0:
+            return tracks
+            
+        # For each unnamed track, try to match with a named track using motion prediction
+        for unnamed_track in unnamed_tracks:
+            best_match = None
+            best_score = float('inf')
+            
+            for named_track in named_tracks:
+                # Skip if this named track is already assigned
+                if any(t.player_name == named_track.player_name for t in tracks if t != unnamed_track):
+                    continue
+                    
+                # Get predicted position for the named track
+                predicted_pos = self._predict_motion(named_track.player_name, 
+                    ((named_track.bbox[0] + named_track.bbox[2]) // 2, 
+                     (named_track.bbox[1] + named_track.bbox[3]) // 2))
+                
+                # Calculate distance to predicted position
+                unnamed_center = ((unnamed_track.bbox[0] + unnamed_track.bbox[2]) // 2,
+                                 (unnamed_track.bbox[1] + unnamed_track.bbox[3]) // 2)
+                
+                distance = np.sqrt((unnamed_center[0] - predicted_pos[0])**2 + 
+                                 (unnamed_center[1] - predicted_pos[1])**2)
+                
+                if distance < best_score:
+                    best_score = distance
+                    best_match = named_track
+            
+            # Assign the best match if distance is reasonable
+            if best_match and best_score < 50:  # Within 50 pixels
+                print(f"CROSSING: Assigning {best_match.player_name} to track {unnamed_track.id} (distance: {best_score:.1f})")
+                unnamed_track.set_player_name(best_match.player_name)
+                
+                # Update mappings
+                self.track_to_player_map[unnamed_track.id] = best_match.player_name
+                self.player_to_track_map[best_match.player_name] = unnamed_track.id
+                
+                # Remove the old track from named_tracks to prevent double assignment
+                named_tracks = [t for t in named_tracks if t != best_match]
+        
+        return tracks
         
     def process_video(self, video_path, output_path=None, display=True, max_display_width=None, max_display_height=None):
         """
@@ -881,6 +1331,9 @@ def main():
     parser.add_argument('--det-conf', type=float, default=0.5, help='Person detection confidence threshold')
     parser.add_argument('--reid-thresh', type=float, default=0.5, help='Re-ID similarity threshold')
     parser.add_argument('--cpu', action='store_true', help='Use CPU instead of GPU')
+    parser.add_argument('--debug-duplicates', action='store_true', help='Enable debug output for duplicate detection')
+    parser.add_argument('--debug-crossing', action='store_true', help='Enable debug output for crossing detection')
+    parser.add_argument('--max-players', type=int, default=2, help='Maximum number of players to track (default: 2)')
     
     args = parser.parse_args()
     
@@ -888,7 +1341,10 @@ def main():
     tracker = SquashPlayerTracker(
         detection_conf=args.det_conf,
         reid_threshold=args.reid_thresh,
-        use_gpu=not args.cpu
+        use_gpu=not args.cpu,
+        debug_duplicates=args.debug_duplicates,
+        debug_crossing=args.debug_crossing,
+        max_players=args.max_players
     )
     
     # Process video

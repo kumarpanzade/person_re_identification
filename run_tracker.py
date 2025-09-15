@@ -7,9 +7,6 @@ squash player tracking system on video files.
 
 Example usage:
     python run_tracker.py --video path/to/squash_video.mp4 --output results.mp4
-    
-With fps preprocessing:
-    python run_tracker.py --video path/to/squash_video.mp4 --output results.mp4 --preprocess --target-fps 20
 """
 
 import os
@@ -19,7 +16,6 @@ import argparse
 import tempfile
 import datetime
 from squash_player_tracker.squash_tracker import SquashPlayerTracker
-from preprocess_video import preprocess_video
 from result_manager import create_result_directory, get_result_path, copy_input_to_results, save_run_info
 
 def main():
@@ -31,16 +27,12 @@ def main():
                         help='Path to save output video (optional)')
     parser.add_argument('--no-display', action='store_true',
                         help='Disable display of processed frames')
-    parser.add_argument('--det-conf', type=float, default=0.5,
+    parser.add_argument('--det-conf', type=float, default=0.6,
                         help='Person detection confidence threshold')
     parser.add_argument('--reid-thresh', type=float, default=0.35,
                         help='Re-ID similarity threshold')
     parser.add_argument('--cpu', action='store_true',
                         help='Use CPU instead of GPU')
-    parser.add_argument('--preprocess', action='store_true',
-                        help='Preprocess video to target FPS without skipping frames')
-    parser.add_argument('--target-fps', type=float, default=20.0,
-                        help='Target FPS for preprocessing (default: 20.0)')
     parser.add_argument('--max-width', type=int, default=None, 
                         help='Maximum display width (auto-detected if not specified)')
     parser.add_argument('--max-height', type=int, default=None,
@@ -85,23 +77,7 @@ def main():
             use_gpu=not args.cpu
         )
         
-        # Handle video preprocessing if requested
         video_path = args.video
-        if args.preprocess:
-            print(f"Preprocessing video to {args.target_fps} FPS without skipping frames...")
-            
-            # Create a temporary file for the preprocessed video
-            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
-                temp_video_path = temp_file.name
-            
-            # Preprocess the video
-            success = preprocess_video(args.video, temp_video_path, args.target_fps)
-            if not success:
-                print("Error: Video preprocessing failed")
-                return 1
-                
-            print(f"Video preprocessing complete. Using preprocessed video for tracking.")
-            video_path = temp_video_path
         
         # Process video
         print(f"Processing video: {video_path}")
@@ -113,10 +89,6 @@ def main():
             max_display_height=args.max_height
         )
         
-        # Clean up temporary file if preprocessing was used
-        if args.preprocess and os.path.exists(temp_video_path):
-            os.remove(temp_video_path)
-            print(f"Temporary preprocessed video removed")
         
         print("Processing complete!")
         print(f"Output saved to: {output_path}")

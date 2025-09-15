@@ -4,7 +4,7 @@ import torch
 from ultralytics import YOLO
 
 class PersonDetector:
-    def __init__(self, model_path=None, conf_threshold=0.5):
+    def __init__(self, model_path=None, conf_threshold=0.6):
         """
         Initialize the person detector using YOLOv8.
         
@@ -16,7 +16,7 @@ class PersonDetector:
         if model_path:
             self.model = YOLO(model_path)
         else:
-            self.model = YOLO("yolov8n.pt")  # Use small model for real-time performance
+            self.model = YOLO("yolov8l.pt")  # Use small model for real-time performance
         
         self.conf_threshold = conf_threshold
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
