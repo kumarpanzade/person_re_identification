@@ -38,9 +38,9 @@ def get_screen_resolution():
         return 1280, 720
 
 class SquashPlayerTracker:
-    def __init__(self, detection_conf=0.6, reid_threshold=0.6, use_gpu=True, reference_embeddings=None, 
-                 duplicate_iou_threshold=0.3, duplicate_distance_threshold=30, debug_duplicates=False, 
-                 debug_crossing=False, max_players=2):
+    def __init__(self, detection_conf=0.6, reid_threshold=0.9, use_gpu=True, reference_embeddings=None, 
+                 duplicate_iou_threshold=0.2, duplicate_distance_threshold=90, debug_duplicates=True, 
+                 debug_crossing=True, max_players=2):
         """
         Initialize the squash player tracking system.
         
@@ -79,7 +79,7 @@ class SquashPlayerTracker:
         
         # Track player ID consistency
         self.player_track_history = {}  # Map player ID to their track history
-        self.reid_memory_frames = 10000  # Remember player associations for 30 frames
+        self.reid_memory_frames = 100000  # Remember player associations for 30 frames
         self.player_positions = {}  # Last known positions of players
         
         # Direct mapping of track IDs to player IDs for stronger consistency
@@ -105,7 +105,7 @@ class SquashPlayerTracker:
         self.player_motion_history = {}  # Store motion vectors for each player
         self.crossing_detected = False
         self.crossing_frames = 0
-        self.max_crossing_frames = 60  # Maximum frames to consider as crossing
+        self.max_crossing_frames = 90  # Maximum frames to consider as crossing
         self.motion_prediction_weight = 0.8  # Weight for motion prediction vs appearance
         
         # Initialize with reference embeddings if provided

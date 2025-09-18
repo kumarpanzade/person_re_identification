@@ -26,9 +26,9 @@ class PersonReID:
         
         # Dictionary to store person feature vectors
         self.person_features = {}
-        self.similarity_threshold = 0.8  # Lower threshold for more permissive matching
+        self.similarity_threshold = 0.3  # Lower threshold for more permissive matching
         self.features_history = {}  # Store multiple feature vectors per person
-        self.max_history_size = 30   # Number of feature vectors to store per person
+        self.max_history_size = 50   # Number of feature vectors to store per person
         
         # Flag to indicate if re-ID has been initialized with reference embeddings
         self.is_initialized = False
@@ -38,7 +38,7 @@ class PersonReID:
         # Enhanced tracking consistency
         self.last_assignments = {}  # Track ID -> Player ID
         self.assignment_history = {}  # Track ID -> list of Player IDs with counts
-        self.id_consistency_window = 60  # Number of frames to consider for ID consistency
+        self.id_consistency_window = 100  # Number of frames to consider for ID consistency
         self.strict_id_enforcement = True  # Whether to enforce strict ID consistency
     
     def extract_features(self, image, bbox):
@@ -129,7 +129,7 @@ class PersonReID:
         # First check if this is a reference embedding
         if self.reference_embeddings:
             # Prioritize reference embeddings by using a higher base similarity
-            reference_boost = 0.4  # Boost reference similarities to prioritize them
+            reference_boost = 0.6  # Boost reference similarities to prioritize them
             
             for person_id, ref_features in self.reference_embeddings.items():
                 # Calculate cosine similarity
