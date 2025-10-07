@@ -2,11 +2,17 @@ import os
 import numpy as np
 import torch
 import torchreid
-from torchreid.utils.feature_extractor import FeatureExtractor
+try:
+    from torchreid.reid.utils import FeatureExtractor
+except ImportError:
+    try:
+        from torchreid.utils.feature_extractor import FeatureExtractor
+    except ImportError:
+        from torchreid.utils import FeatureExtractor
 
 
 class PersonReID:
-    def __init__(self, model_name='osnet_x1_0', model_path=None, use_gpu=True):
+    def __init__(self, model_name='osnet_x1_0', model_path=None, use_gpu=True, device=None):
         """
         Initialize person re-identification model using OSNet.
         
@@ -14,8 +20,9 @@ class PersonReID:
             model_name (str): Name of the model architecture
             model_path (str): Path to custom weights file, if None use pretrained
             use_gpu (bool): Whether to use GPU for inference
+            device (torch.device): Specific device to use (optional)
         """
-        self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        self.device = device if device is not None else ('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
         
         # Initialize the feature extractor
         self.extractor = FeatureExtractor(
@@ -23,6 +30,15 @@ class PersonReID:
             model_path=model_path,
             device=self.device
         )
+        
+        # CUDA optimizations for feature extraction
+        if self.device == 'cuda':
+            print(f"Person Re-ID model using GPU with optimizations: {self.device}")
+            # Note: Half precision disabled to avoid type mismatch with YOLO model
+            # if hasattr(self.extractor, 'model') and hasattr(self.extractor.model, 'half'):
+            #     self.extractor.model.half()
+        else:
+            print(f"Person Re-ID model using CPU: {self.device}")
         
         # Dictionary to store person feature vectors
         self.person_features = {}
@@ -40,6 +56,13 @@ class PersonReID:
         self.assignment_history = {}  # Track ID -> list of Player IDs with counts
         self.id_consistency_window = 100  # Number of frames to consider for ID consistency
         self.strict_id_enforcement = True  # Whether to enforce strict ID consistency
+        
+        # Flexible ID management system
+        self.id_memory = {}  # Store all previously seen person IDs and their features
+        self.available_ids = set()  # Track which IDs are currently available
+        self.next_id_counter = 1  # Counter for generating new IDs
+        self.id_reuse_threshold = 0.4  # Threshold for reusing previous IDs
+        self.max_id_memory = 50  # Maximum number of IDs to remember
     
     def extract_features(self, image, bbox):
         """
@@ -100,6 +123,91 @@ class PersonReID:
         # Debug output for tracking re-ID
         print(f"Stored initial features for {person_id}, total people: {len(self.person_features)}")
         return True
+    
+    def get_flexible_id(self, image, bbox):
+        """
+        Get a flexible ID for a person - either reuse previous ID or create new one.
+        
+        Args:
+            image: Image containing the person
+            bbox: Bounding box of the person
+            
+        Returns:
+            str: Person ID (either reused or new)
+        """
+        # Extract features from current detection
+        features = self.extract_features(image, bbox)
+        if features is None:
+            return self._generate_new_id()
+        
+        # First, try to match with previously seen people
+        best_match_id = None
+        best_similarity = 0
+        
+        for person_id, stored_features in self.id_memory.items():
+            # Calculate similarity with stored features
+            similarity = np.dot(features, stored_features) / (
+                np.linalg.norm(features) * np.linalg.norm(stored_features)
+            )
+            
+            if similarity > best_similarity and similarity > self.id_reuse_threshold:
+                best_similarity = similarity
+                best_match_id = person_id
+        
+        # If we found a good match, reuse the ID
+        if best_match_id and best_match_id in self.available_ids:
+            print(f"REUSING ID: {best_match_id} (similarity: {best_similarity:.3f})")
+            # Remove from available IDs since it's being used
+            self.available_ids.discard(best_match_id)
+            return best_match_id
+        
+        # If no good match found, create new ID
+        new_id = self._generate_new_id()
+        print(f"CREATING NEW ID: {new_id}")
+        return new_id
+    
+    def _generate_new_id(self):
+        """Generate a new person ID"""
+        # Find the next available ID
+        while f"P{self.next_id_counter}" in self.id_memory:
+            self.next_id_counter += 1
+        
+        new_id = f"P{self.next_id_counter}"
+        self.next_id_counter += 1
+        return new_id
+    
+    def register_person_id(self, person_id, image, bbox):
+        """
+        Register a person ID with their features for future reuse.
+        
+        Args:
+            person_id: The person ID to register
+            image: Image containing the person
+            bbox: Bounding box of the person
+        """
+        features = self.extract_features(image, bbox)
+        if features is not None:
+            # Store in ID memory for future reuse
+            self.id_memory[person_id] = features
+            
+            # Limit memory size
+            if len(self.id_memory) > self.max_id_memory:
+                # Remove oldest entries (simple FIFO)
+                oldest_id = next(iter(self.id_memory))
+                del self.id_memory[oldest_id]
+            
+            print(f"REGISTERED ID: {person_id} in memory (total: {len(self.id_memory)})")
+    
+    def release_person_id(self, person_id):
+        """
+        Release a person ID when they leave the frame.
+        
+        Args:
+            person_id: The person ID to release
+        """
+        if person_id in self.id_memory:
+            self.available_ids.add(person_id)
+            print(f"RELEASED ID: {person_id} (now available for reuse)")
     
     def identify_person(self, image, bbox):
         """

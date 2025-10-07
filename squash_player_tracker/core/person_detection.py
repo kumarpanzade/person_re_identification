@@ -4,22 +4,34 @@ import torch
 from ultralytics import YOLO
 
 class PersonDetector:
-    def __init__(self, model_path=None, conf_threshold=0.6):
+    def __init__(self, model_path=None, conf_threshold=0.6, use_gpu=True, device=None):
         """
         Initialize the person detector using YOLOv8.
         
         Args:
             model_path (str): Path to a custom YOLOv8 model, if None use pretrained
             conf_threshold (float): Confidence threshold for detections
+            use_gpu (bool): Whether to use GPU for inference
+            device (torch.device): Specific device to use (optional)
         """
+        self.device = device if device is not None else torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
+        
         # Load YOLOv8 model (either custom or pretrained)
         if model_path:
             self.model = YOLO(model_path)
         else:
-            self.model = YOLO("yolov8l.pt")  # Use small model for real-time performance
+            self.model = YOLO("yolov8l.pt")  # Use large model for better accuracy
+        
+        # Move model to device and enable optimizations
+        if self.device.type == 'cuda':
+            self.model.to(self.device)
+            # Note: Half precision disabled to avoid type mismatch with PersonReID model
+            # self.model.model.half()  # Use half precision for faster inference
+            print(f"YOLO model moved to GPU: {self.device}")
+        else:
+            print(f"YOLO model using CPU: {self.device}")
         
         self.conf_threshold = conf_threshold
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
     def detect(self, image):
         """

@@ -20,16 +20,22 @@ class DeepSORTTracker:
         # - max_age: tracks are deleted if not updated in this many frames
         # - n_init: number of consecutive detections before confirming a track
         # - max_iou_distance: gating for association
+        # Use mobilenet embedder to avoid torchreid import issues
+        # The deep_sort_realtime library has compatibility issues with newer torchreid versions
+        print("Using mobilenet embedder for DeepSORT tracker")
+        embedder_to_use = "torchreid"
+        embedder_gpu = True  # mobilenet embedder doesn't support GPU in deep_sort_realtime
+        
         self.ds = DeepSort(
             max_age=max_age,
             n_init=n_init,
             max_iou_distance=max(0.1, iou_threshold),  # keep small but >0
             max_cosine_distance=0.8,  # More permissive appearance matching (default is 0.2)
             nn_budget=100,  # Larger appearance descriptor budget
-            embedder=embedder,  # 'mobilenet' is lightweight
+            embedder=embedder_to_use,  # Use available embedder
             half=half,
             bgr=True,  # our frames are BGR (OpenCV)
-            embedder_gpu=True,  # set True if you want GPU for embedder
+            embedder_gpu=embedder_gpu,  # set True if you want GPU for embedder
         )
 
         self.min_hits = min_hits

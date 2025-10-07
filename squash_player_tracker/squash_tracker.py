@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import time
 import ctypes
+import torch
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 
@@ -13,9 +14,12 @@ from squash_player_tracker.core.person_reid import PersonReID
 from squash_player_tracker.core.deepsort_tracker import DeepSORTTracker
 from squash_player_tracker.utils.visualization import draw_player_info
 try:
-    from torchreid.utils import FeatureExtractor
+    from torchreid.reid.utils import FeatureExtractor
 except Exception:
-    from torchreid.utils.feature_extractor import FeatureExtractor
+    try:
+        from torchreid.utils import FeatureExtractor
+    except Exception:
+        from torchreid.utils.feature_extractor import FeatureExtractor
 
 def get_screen_resolution():
     """
@@ -37,10 +41,41 @@ def get_screen_resolution():
         # Default fallback resolution
         return 1280, 720
 
+def _setup_cuda_device(use_gpu=True):
+    """
+    Setup CUDA device with optimizations
+    
+    Args:
+        use_gpu: Whether to use GPU
+        
+    Returns:
+        torch.device: The device to use for computation
+    """
+    if use_gpu and torch.cuda.is_available():
+        device = torch.device('cuda')
+        
+        # CUDA optimizations
+        torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+        torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
+        
+        # Set memory allocation strategy for better performance
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+        
+        # Print CUDA info
+        print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        print(f"CUDA Capability: {torch.cuda.get_device_capability(0)}")
+        
+        return device
+    else:
+        if use_gpu:
+            print("CUDA not available, falling back to CPU")
+        return torch.device('cpu')
+
 class SquashPlayerTracker:
     def __init__(self, detection_conf=0.6, reid_threshold=0.9, use_gpu=True, reference_embeddings=None, 
                  duplicate_iou_threshold=0.2, duplicate_distance_threshold=90, debug_duplicates=True, 
-                 debug_crossing=True, max_players=2):
+                 debug_crossing=True, max_players=5):
         """
         Initialize the squash player tracking system.
         
@@ -54,12 +89,18 @@ class SquashPlayerTracker:
         """
         print("Initializing Squash Player Tracker...")
         
+        # CUDA optimization setup
+        self.device = _setup_cuda_device(use_gpu)
+        print(f"Using device: {self.device}")
+        
         # Initialize components
         print("Loading person detection model...")
-        self.person_detector = PersonDetector(conf_threshold=detection_conf)
+        self.person_detector = PersonDetector(conf_threshold=detection_conf, use_gpu=use_gpu, device=self.device)
         
         print("Loading person re-identification model...")
-        self.person_reid = PersonReID(use_gpu=use_gpu)
+        # Convert device to string for PersonReID
+        device_str = self.device.type if hasattr(self.device, 'type') else str(self.device)
+        self.person_reid = PersonReID(use_gpu=use_gpu, device=device_str)
         self.person_reid.similarity_threshold = reid_threshold
         
         print("Initializing tracker...")
@@ -71,6 +112,7 @@ class SquashPlayerTracker:
         self.player_ids = {}  # Mapping from track ID to player name/ID
         self.current_frame = 0
         self.player_features = {}  # Storing player features for re-identification
+        self.previous_active_ids = set()  # Track IDs that were active in previous frame
         
         # Add temporal consistency tracking with median filtering for smooth tracking
         self.last_valid_tracks = []
@@ -112,7 +154,47 @@ class SquashPlayerTracker:
         if reference_embeddings:
             self.set_reference_embeddings(reference_embeddings)
         
+        # Performance monitoring
+        self.performance_stats = {
+            'total_frames': 0,
+            'total_processing_time': 0.0,
+            'cuda_memory_used': 0.0,
+            'cuda_memory_allocated': 0.0
+        }
+        
         print("Initialization complete!")
+        self._log_cuda_status()
+    
+    def _log_cuda_status(self):
+        """Log CUDA status and memory usage"""
+        if self.device.type == 'cuda':
+            memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+            memory_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+            print(f"CUDA Memory - Allocated: {memory_allocated:.2f} GB, Reserved: {memory_reserved:.2f} GB")
+            
+            # Update performance stats
+            self.performance_stats['cuda_memory_allocated'] = memory_allocated
+            self.performance_stats['cuda_memory_used'] = memory_reserved
+    
+    def _update_performance_stats(self, processing_time):
+        """Update performance statistics"""
+        self.performance_stats['total_frames'] += 1
+        self.performance_stats['total_processing_time'] += processing_time
+        
+        if self.device.type == 'cuda':
+            memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+            self.performance_stats['cuda_memory_used'] = memory_allocated
+        
+    def get_performance_stats(self):
+        """Get current performance statistics"""
+        stats = self.performance_stats.copy()
+        if stats['total_frames'] > 0:
+            stats['avg_processing_time'] = stats['total_processing_time'] / stats['total_frames']
+            stats['fps'] = 1.0 / stats['avg_processing_time'] if stats['avg_processing_time'] > 0 else 0
+        else:
+            stats['avg_processing_time'] = 0
+            stats['fps'] = 0
+        return stats
         
     def ensure_features_initialized_once(self, player_id, frame=None, bbox=None):
         """
@@ -265,6 +347,7 @@ class SquashPlayerTracker:
             processed_frame: Processed frame with visualizations
             player_info: Dictionary of player information
         """
+        start_time = time.time()
         self.current_frame += 1
         frame_copy = frame.copy()
         player_info = {}
@@ -447,7 +530,7 @@ class SquashPlayerTracker:
                             self.player_to_track_map[best_match] = track.id
                             print(f"MOTION MATCH: {best_match} -> track {track.id} (distance: {best_score:.1f})")
                 
-                # Assign remaining IDs to tracks without names
+                # Assign flexible IDs to tracks without names
                 unnamed_tracks = [t for t in active_tracks if not t.player_name]
                 if unnamed_tracks:
                     # Sort by horizontal position for consistent assignment
@@ -455,12 +538,16 @@ class SquashPlayerTracker:
                     
                     for i, track in enumerate(unnamed_tracks):
                         if i < self.max_players:  # Support up to max_players
-                            player_id = f"P{i+1}"
+                            # Use flexible ID system - either reuse previous ID or create new one
+                            player_id = self.person_reid.get_flexible_id(frame, track.bbox)
                             track.set_player_name(player_id)
                             self.track_to_player_map[track.id] = player_id
                             self.player_to_track_map[player_id] = track.id
+                            
+                            # Register the person ID for future reuse
+                            self.person_reid.register_person_id(player_id, frame, track.bbox)
                             self.ensure_features_initialized_once(player_id, frame, track.bbox)
-                            print(f"NEW ASSIGNMENT: {player_id} -> track {track.id}")
+                            print(f"FLEXIBLE ASSIGNMENT: {player_id} -> track {track.id}")
         
         # Apply our enhanced ID consistency enforcement to all tracks
         final_tracks = []
@@ -558,7 +645,43 @@ class SquashPlayerTracker:
         # Update player positions for next frame
         self._update_player_positions(active_tracks)
         
+        # Handle flexible ID management - release IDs for people who left
+        self._manage_flexible_ids(active_tracks)
+        
+        # Update performance statistics
+        processing_time = time.time() - start_time
+        self._update_performance_stats(processing_time)
+        
         return frame_copy, player_info
+    
+    def _manage_flexible_ids(self, active_tracks):
+        """
+        Manage flexible IDs - release IDs for people who left the frame.
+        
+        Args:
+            active_tracks: List of currently active tracks
+        """
+        # Get currently active player IDs
+        current_active_ids = set()
+        for track in active_tracks:
+            if track.player_name:
+                current_active_ids.add(track.player_name)
+        
+        # Find IDs that were active in previous frame but not in current frame
+        released_ids = self.previous_active_ids - current_active_ids
+        
+        # Release IDs for people who left
+        for person_id in released_ids:
+            self.person_reid.release_person_id(person_id)
+            # Clean up mappings
+            if person_id in self.player_to_track_map:
+                track_id = self.player_to_track_map[person_id]
+                del self.player_to_track_map[person_id]
+                if track_id in self.track_to_player_map:
+                    del self.track_to_player_map[track_id]
+        
+        # Update previous active IDs for next frame
+        self.previous_active_ids = current_active_ids.copy()
         
     def _update_player_positions(self, tracks):
         """
@@ -1319,6 +1442,19 @@ class SquashPlayerTracker:
         if processing_times:
             avg_time = sum(processing_times) / len(processing_times)
             print(f"Average processing time per frame: {avg_time:.3f}s ({1/avg_time:.1f} FPS)")
+            
+            # Print CUDA performance stats if available
+            if self.device.type == 'cuda':
+                final_stats = self.get_performance_stats()
+                print(f"CUDA Performance Stats:")
+                print(f"  Total frames processed: {final_stats['total_frames']}")
+                print(f"  Average FPS: {final_stats['fps']:.1f}")
+                print(f"  Peak CUDA memory used: {final_stats['cuda_memory_used']:.2f} GB")
+                
+                # Log final CUDA memory status
+                memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+                memory_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+                print(f"  Final CUDA memory - Allocated: {memory_allocated:.2f} GB, Reserved: {memory_reserved:.2f} GB")
     
 
 

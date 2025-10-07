@@ -16,7 +16,7 @@ import argparse
 import tempfile
 import datetime
 from squash_player_tracker.squash_tracker import SquashPlayerTracker
-from result_manager import create_result_directory, get_result_path, copy_input_to_results, save_run_info
+from result_manager import create_result_directory, get_result_path, copy_input_to_results
 
 def main():
     # Parse command line arguments
@@ -62,10 +62,10 @@ def main():
     # Save a copy of the input video for reference
     copy_input_to_results(args.video, result_dirs)
     
-    # Save run information
-    params = vars(args)
-    description = f"Player tracking run on video: {args.video}"
-    save_run_info(result_dirs, params, description)
+    # Save run information (disabled)
+    # params = vars(args)
+    # description = f"Player tracking run on video: {args.video}"
+    # save_run_info(result_dirs, params, description)
     
     print("Initializing Squash Player Tracker...")
     
